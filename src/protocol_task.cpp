@@ -23,6 +23,14 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.protocol";
 
+// A tick that returns 0 asks to run again at once. Waiting for 0 ticks does not block, so a
+// continuous backlog (a stream keeping the inbound ring busy, or a timer due now) spins the task
+// at its priority without ever scheduling the lower-priority main loop and idle tasks. On ESP32
+// that starves ESPHome's loopTask past the 5 s task watchdog. Wait two ticks instead: short
+// enough that a backlog still drains at full speed, long enough for the main loop to run. Two
+// rather than one because a one-tick wait can end almost at once (platform_ms_to_ticks()).
+static constexpr uint32_t WORK_PENDING_YIELD_MS = 2;
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -104,8 +112,10 @@ void ProtocolTask::thread_entry(ProtocolTask* self) {
     for (;;) {
         const uint32_t next_deadline_ms = self->tick_();
         // NO_DEADLINE is UINT32_MAX, which EventFlags::wait() takes as no timeout.
+        const uint32_t wait_ms =
+            next_deadline_ms == 0 ? WORK_PENDING_YIELD_MS : next_deadline_ms;
         const uint32_t bits =
-            self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, false, true, next_deadline_ms);
+            self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, false, true, wait_ms);
         if ((bits & COMMAND_STOP) != 0) {
             // One final tick, so the work queued and posted before stop() was called is seen by
             // the task.
