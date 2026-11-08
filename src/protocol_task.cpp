@@ -16,7 +16,9 @@
 
 #include "platform/logging.h"
 #include "platform/thread.h"
+#include "platform/time.h"
 
+#include <chrono>
 #include <utility>
 
 namespace sendspin {
@@ -25,11 +27,22 @@ static const char* const TAG = "sendspin.protocol";
 
 // A tick that returns 0 asks to run again at once. Waiting for 0 ticks does not block, so a
 // continuous backlog (a stream keeping the inbound ring busy, or a timer due now) spins the task
-// at its priority without ever scheduling the lower-priority main loop and idle tasks. On ESP32
-// that starves ESPHome's loopTask past the 5 s task watchdog. Wait two ticks instead: short
-// enough that a backlog still drains at full speed, long enough for the main loop to run. Two
-// rather than one because a one-tick wait can end almost at once (platform_ms_to_ticks()).
+// at its priority without ever scheduling the lower-priority main loop and idle tasks.
 static constexpr uint32_t WORK_PENDING_YIELD_MS = 2;
+
+// A timeout on EventFlags::wait() is not a yield when the flag is already set: the transport sets
+// WORK_PENDING for every inbound message, so while a catch-up backlog is being delivered the bit
+// is set almost continuously and the wait returns at once whatever its timeout. That defeats the
+// 2 ms wait above and lets the task run without ever blocking.
+//
+// Bound the busy stretch explicitly instead, as SyncTask::yield_if_busy() does: once the task has
+// run for PROTOCOL_MAX_BUSY_US without a wait that actually blocked, sleep for
+// PROTOCOL_BUSY_YIELD_MS. A backlog still drains far faster than real time (32 items per tick),
+// and the lower-priority ESPHome loopTask and idle tasks get scheduled every 50 ms, well inside
+// the 5 s task watchdog. Normal sink-paced playback blocks in the wait every tick and takes no
+// extra sleeps.
+static constexpr int64_t PROTOCOL_MAX_BUSY_US = 50000;
+static constexpr uint32_t PROTOCOL_BUSY_YIELD_MS = 5;
 
 // ============================================================================
 // Lifecycle
@@ -109,13 +122,28 @@ void ProtocolTask::open_accepts() {
 }
 
 void ProtocolTask::thread_entry(ProtocolTask* self) {
+    // Reset whenever a wait really blocks; a wait that returns at once is part of the busy
+    // stretch. See PROTOCOL_MAX_BUSY_US.
+    int64_t busy_since_us = platform_time_us();
     for (;;) {
         const uint32_t next_deadline_ms = self->tick_();
+        if (next_deadline_ms == 0 &&
+            platform_time_us() - busy_since_us > PROTOCOL_MAX_BUSY_US) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(PROTOCOL_BUSY_YIELD_MS));
+            busy_since_us = platform_time_us();
+        }
         // NO_DEADLINE is UINT32_MAX, which EventFlags::wait() takes as no timeout.
         const uint32_t wait_ms =
             next_deadline_ms == 0 ? WORK_PENDING_YIELD_MS : next_deadline_ms;
+        // A set flag makes the wait return at once whatever the timeout, and the transport sets
+        // WORK_PENDING for every inbound message, so only a wait on clear flags yields the CPU.
+        const bool wait_can_block =
+            (self->event_flags_.get() & (COMMAND_STOP | WORK_PENDING)) == 0;
         const uint32_t bits =
             self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, false, true, wait_ms);
+        if (wait_can_block) {
+            busy_since_us = platform_time_us();
+        }
         if ((bits & COMMAND_STOP) != 0) {
             // One final tick, so the work queued and posted before stop() was called is seen by
             // the task.
